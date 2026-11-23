@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#080c14" />
+  <meta name="description" content="PulmoScan — Explainable Deep Learning System for Chest Radiographs (Classification, Lesion Segmentation & Report Generation). Developed at Government Hydro Engineering College, Bandla, Bilaspur." />
+  <title>PulmoScan — Clinical X-AI Workbench | GHEC Bilaspur</title>
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="/images/logo.png" />
+  <link rel="apple-touch-icon" href="/images/logo.png" />
+
+  <!-- Typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <!-- Stylesheets -->
+  <link rel="stylesheet" href="/css/styles.css?v=20261123-2" />
+  <link rel="stylesheet" href="/css/react-app.css?v=20261123-2" />
+</head>
+<body class="dark">
+  <!-- React Root Mount Point -->
+  <div id="root">
+    <!-- Initial Loading State Skeleton while scripts execute -->
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; background:#080c14; color:#94a3b8; font-family:'Inter', sans-serif;">
+      <div style="position:relative; width:64px; height:64px; margin-bottom:20px;">
+        <img src="/images/logo.png" alt="PulmoScan Logo" style="width:100%; height:100%; object-fit:contain; border-radius:12px; animation: pulse 1.5s infinite ease-in-out;" />
+      </div>
+      <h2 style="color:#ffffff; font-size:1.25rem; font-weight:700; margin:0 0 8px 0; letter-spacing:-0.02em;">PulmoScan</h2>
+      <p style="font-size:0.875rem; color:#64748b; margin:0 0 16px 0;">Government Hydro Engineering College, Bilaspur</p>
+      <div style="width:160px; height:3px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden;">
+        <div style="width:40%; height:100%; background:linear-gradient(90deg, #38bdf8, #818cf8); animation: loadingBar 1.2s infinite ease-in-out;"></div>
+      </div>
+    </div>
+  </div>
+
+  <noscript>
+    <div style="padding: 2rem; text-align: center; color: #ef4444; background: #0b1120; min-height: 100vh; font-family: sans-serif;">
+      <h2>JavaScript Required</h2>
+      <p>PulmoScan requires JavaScript enabled to render its React clinical workbench interface and interactive visualizations.</p>
+    </div>
+  </noscript>
+
+  <style>
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.06); opacity: 0.85; }
+    }
+    @keyframes loadingBar {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(350%); }
+    }
+  </style>
+
+  <!-- Core Offline Libraries -->
+  <script src="/js/react.min.js"></script>
+  <script src="/js/react-dom.min.js"></script>
+  <script src="/js/chart.min.js"></script>
+
+  <!-- Pre-transpiled React Application Bundle -->
+  <script src="/js/app.bundle.js?v=20261123-2"></script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+{
+  "name": "pulmovision-xai",
+  "version": "2.4.0",
+  "description": "Explainable Deep Learning System for Chest Radiographs (Classification, Lesion Segmentation & Report Generation)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": "node build-react.js",
+    "build:react": "node build-react.js"
+  },
+  "keywords": [
+    "deep-learning",
+    "chest-xray",
+    "pneumothorax-segmentation",
+    "pneumonia-classification",
+    "report-generation",
+    "explainable-ai",
+    "grad-cam",
+    "attention-maps"
+  ],
+  "author": "Aman (23010503008), Samriti (23010503053), Simran (23010503064), Sparsh Thakur (23010503066)",
+  "mentor": "Dr. Ravi Kumar, Assistant Professor, CSE, GHEC Bandla",
+  "license": "MIT",
+  "dependencies": {
+    "chart.js": "^4.6.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  }
+}
