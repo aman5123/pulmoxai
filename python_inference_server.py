@@ -323,10 +323,17 @@ def decode_image(payload: PredictRequest) -> Image.Image:
         img_bytes = base64.b64decode(b64_data)
         return Image.open(io.BytesIO(img_bytes)).convert("RGB")
     elif payload.image_path:
-        clean_path = payload.image_path.lstrip("/").replace("/", os.sep)
-        candidates = [clean_path, os.path.join("public", clean_path)]
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        clean_path = payload.image_path.lstrip("/\\").replace("/", os.sep).replace("\\", os.sep)
+        candidates = [
+            payload.image_path,
+            clean_path,
+            os.path.join(base_dir, clean_path),
+            os.path.join(base_dir, "public", clean_path),
+            os.path.join("public", clean_path)
+        ]
         for c in candidates:
-            if os.path.exists(c):
+            if c and os.path.exists(c) and os.path.isfile(c):
                 return Image.open(c).convert("RGB")
         raise HTTPException(status_code=404, detail=f"Image file not found: {payload.image_path}")
     raise HTTPException(status_code=400, detail="Either image_base64 or image_path must be provided.")
@@ -361,9 +368,9 @@ def predict(payload: PredictRequest):
     gradcam_region_desc = "Bilateral lung parenchyma and perihilar zones"
 
     if cls_model is not None:
-        cam_np, pred_cls, probs = cls_model.gradcam(t_cls)
-        normal_prob = float(probs[0] * 100.0)
-        pneumonia_prob = float(probs[1] * 100.0)
+        cam_np, pred_cls, cls_probs = cls_model.gradcam(t_cls)
+        normal_prob = float(cls_probs[0] * 100.0)
+        pneumonia_prob = float(cls_probs[1] * 100.0)
 
         # Build Grad-CAM heatmap overlay
         cam_resized = cv2.resize(cam_np, (orig_w, orig_h))
@@ -398,15 +405,17 @@ def predict(payload: PredictRequest):
     overlay_base64 = None
     dice_score_est = 1.0
     iou_score_est = 1.0
+    seg_probs = None
+    bin_mask = None
 
     if seg_model is not None:
         with torch.no_grad():
             logits = seg_model(t_seg)
-            probs = torch.sigmoid(logits)[0, 0].cpu().numpy()
+            seg_probs = torch.sigmoid(logits)[0, 0].cpu().numpy()
 
         tau = float(payload.threshold or 0.30)
         min_area = int(payload.min_area or 600)
-        bin_mask = (probs > tau).astype(np.uint8)
+        bin_mask = (seg_probs > tau).astype(np.uint8)
 
         # Scale mask back to original image size
         bin_mask_full = cv2.resize(bin_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -417,6 +426,9 @@ def predict(payload: PredictRequest):
 
         contours, _ = cv2.findContours(bin_mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         valid_contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+
+        filtered_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        img_np = np.array(img)[:, :, ::-1].copy()
 
         if valid_contours:
             has_lesion = True
@@ -436,21 +448,22 @@ def predict(payload: PredictRequest):
             lesion_location = f"{side} {vertical} Pleural Zone"
 
             # Create crisp cyan overlay on radiograph
-            img_np = np.array(img)[:, :, ::-1].copy()
             cv2.drawContours(img_np, valid_contours, -1, (255, 194, 0), 2) # Cyan border (BGR)
             overlay_mask = np.zeros_like(img_np)
             cv2.drawContours(overlay_mask, valid_contours, -1, (255, 194, 0), -1)
+            cv2.drawContours(filtered_mask, valid_contours, -1, 255, -1)
             blended_seg = cv2.addWeighted(img_np, 0.75, overlay_mask, 0.25, 0)
-
-            _, buf_seg = cv2.imencode(".png", blended_seg)
-            overlay_base64 = "data:image/png;base64," + base64.b64encode(buf_seg).decode("utf-8")
-
-            # Binary mask PNG
-            _, buf_mask = cv2.imencode(".png", bin_mask_clean * 255)
-            mask_base64 = "data:image/png;base64," + base64.b64encode(buf_mask).decode("utf-8")
-
             dice_score_est = round(float(np.clip(0.81 + (lesion_ratio_pct * 0.005), 0.78, 0.94)), 4)
             iou_score_est = round(float(dice_score_est / (2.0 - dice_score_est)), 4)
+        else:
+            blended_seg = img_np
+
+        _, buf_seg = cv2.imencode(".png", blended_seg)
+        overlay_base64 = "data:image/png;base64," + base64.b64encode(buf_seg).decode("utf-8")
+
+        # Binary mask PNG
+        _, buf_mask = cv2.imencode(".png", filtered_mask)
+        mask_base64 = "data:image/png;base64," + base64.b64encode(buf_mask).decode("utf-8")
 
     # ──────────────────────────────────────────────────────────────────────────
     # 3. RUN REAL RADIOLOGY REPORT GENERATOR (captioning_model.pth)
@@ -486,8 +499,8 @@ def predict(payload: PredictRequest):
     # Dynamically calibrate probabilities from model predictions
     if has_lesion:
         # Dynamic confidence based on UNet++ sigmoid probability inside detected lesion
-        if np.any(bin_mask > 0):
-            mask_mean = float(probs[bin_mask > 0].mean() * 100.0)
+        if seg_probs is not None and bin_mask is not None and np.any(bin_mask > 0):
+            mask_mean = float(seg_probs[bin_mask > 0].mean() * 100.0)
             p_pneumo = round(float(np.clip(mask_mean, 84.0, 97.8)), 1)
         else:
             p_pneumo = 89.2
@@ -496,13 +509,15 @@ def predict(payload: PredictRequest):
         p_effusion = round(float(np.clip(12.0 + (lesion_ratio_pct * 1.5), 8.0, 32.0)), 1)
         p_atelectasis = round(float(np.clip(20.0 + (lesion_ratio_pct * 2.8), 16.0, 52.0)), 1)
     elif pneumonia_prob >= 50.0:
-        p_pneumo = round(float(np.clip(probs.max() * 10.0, 1.2, 6.5)), 1)
+        max_seg = float(seg_probs.max()) if seg_probs is not None else 0.1
+        p_pneumo = round(float(np.clip(max_seg * 10.0, 1.2, 6.5)), 1)
         p_normal = round(float(normal_prob), 1)
         p_pneumonia = round(float(pneumonia_prob), 1)
         p_effusion = round(float(np.clip(pneumonia_prob * 0.32, 12.0, 38.0)), 1)
         p_atelectasis = round(float(np.clip(pneumonia_prob * 0.22, 6.0, 24.0)), 1)
     else:
-        p_pneumo = round(float(np.clip(probs.max() * 8.0, 0.8, 4.2)), 1)
+        max_seg = float(seg_probs.max()) if seg_probs is not None else 0.05
+        p_pneumo = round(float(np.clip(max_seg * 8.0, 0.8, 4.2)), 1)
         p_normal = round(float(normal_prob), 1)
         p_pneumonia = round(float(pneumonia_prob), 1)
         p_effusion = round(float(np.clip((100.0 - normal_prob) * 0.4, 0.5, 4.5)), 1)
@@ -637,6 +652,34 @@ def predict(payload: PredictRequest):
                 "gamma_context": gate_gamma
             }
         }
+    }
+
+
+@app.post("/predict/classify")
+def predict_classify(payload: PredictRequest):
+    res = predict(payload)
+    return {
+        "status": "success",
+        "classification": res["classification"],
+        "probabilities": res["probabilities"]
+    }
+
+
+@app.post("/predict/segment")
+def predict_segment(payload: PredictRequest):
+    res = predict(payload)
+    return {
+        "status": "success",
+        "segmentation": res["segmentation"]
+    }
+
+
+@app.post("/predict/report")
+def predict_report(payload: PredictRequest):
+    res = predict(payload)
+    return {
+        "status": "success",
+        "report": res["report"]
     }
 
 

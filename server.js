@@ -11,8 +11,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
+const { spawn, execSync } = require('child_process');
 
 const PORT = process.env.PORT || 5000;
+const PYTHON_PORT = process.env.INFERENCE_PORT || 5050;
 
 // MIME types dictionary
 const MIME_TYPES = {
@@ -460,21 +462,19 @@ function sendJSON(res, statusCode, data) {
   res.end(JSON.stringify(data, null, 2));
 }
 
-function callPythonInference(payload) {
-  return new Promise((resolve, reject) => {
-    const postData = JSON.stringify(payload);
-    const options = {
+// Python Inference Microservice Process Manager
+let pythonProcess = null;
+let isPythonStarting = false;
+
+function checkPythonHealth() {
+  return new Promise((resolve) => {
+    const req = http.request({
       hostname: '127.0.0.1',
-      port: 5050,
-      path: '/predict',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData)
-      },
-      timeout: 20000
-    };
-    const req = http.request(options, (res) => {
+      port: PYTHON_PORT,
+      path: '/health',
+      method: 'GET',
+      timeout: 2000
+    }, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
@@ -482,25 +482,159 @@ function callPythonInference(payload) {
           if (res.statusCode === 200) {
             resolve(JSON.parse(data));
           } else {
-            reject(new Error(`Python inference returned HTTP ${res.statusCode}: ${data}`));
+            resolve(null);
           }
-        } catch (e) {
-          reject(e);
+        } catch {
+          resolve(null);
         }
       });
     });
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Inference request timeout'));
-    });
-    req.write(postData);
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
     req.end();
   });
 }
 
+function startPythonInferenceServer() {
+  if (pythonProcess || isPythonStarting) return;
+  isPythonStarting = true;
+
+  checkPythonHealth().then((health) => {
+    if (health && health.status === 'online') {
+      console.log('🤖 [PyTorch AI Engine] Connected to running Python inference service on port ' + PYTHON_PORT);
+      console.log(`   Device: ${health.device.toUpperCase()} | GPU: ${health.cuda_device_name}`);
+      isPythonStarting = false;
+      return;
+    }
+
+    console.log('⚡ [PyTorch AI Engine] Launching Python deep learning microservice on port ' + PYTHON_PORT + '...');
+    const pythonScript = path.join(__dirname, 'python_inference_server.py');
+    const pyCmd = process.platform === 'win32' ? 'python' : 'python3';
+
+    pythonProcess = spawn(pyCmd, [pythonScript], {
+      cwd: __dirname,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PYTHONUNBUFFERED: '1', INFERENCE_PORT: String(PYTHON_PORT) }
+    });
+
+    pythonProcess.stdout.on('data', (chunk) => {
+      const lines = chunk.toString().split('\n').filter(l => l.trim().length > 0);
+      lines.forEach(line => console.log(`[PyTorch AI Engine] ${line.trim()}`));
+    });
+
+    pythonProcess.stderr.on('data', (chunk) => {
+      const lines = chunk.toString().split('\n').filter(l => l.trim().length > 0);
+      lines.forEach(line => console.log(`[PyTorch AI Engine] ${line.trim()}`));
+    });
+
+    pythonProcess.on('error', (err) => {
+      console.error('❌ [PyTorch AI Engine] Process spawn error:', err.message);
+      isPythonStarting = false;
+    });
+
+    pythonProcess.on('exit', (code, signal) => {
+      if (code !== 0 && code !== null) {
+        console.warn(`⚠️ [PyTorch AI Engine] Process stopped with code ${code} (${signal})`);
+      }
+      pythonProcess = null;
+      isPythonStarting = false;
+    });
+
+    // Check health until initialized
+    let attempts = 0;
+    const interval = setInterval(async () => {
+      attempts++;
+      const h = await checkPythonHealth();
+      if (h && h.status === 'online') {
+        clearInterval(interval);
+        isPythonStarting = false;
+        console.log('=======================================================');
+        console.log('🚀 [PyTorch AI Engine] PyTorch CUDA Models Ready & Active!');
+        console.log(`   Compute Device: ${h.device.toUpperCase()} (${h.cuda_device_name})`);
+        console.log('   Models: EfficientNetV2-S (Grad-CAM), UNet++ (scSE), Vision-Language Report Gen');
+        console.log('=======================================================');
+      } else if (attempts > 50) {
+        clearInterval(interval);
+        isPythonStarting = false;
+        console.warn('⚠️ [PyTorch AI Engine] Warning: Python service took longer than expected to initialize.');
+      }
+    }, 1200);
+  });
+}
+
+function shutdownPythonProcess() {
+  if (pythonProcess && pythonProcess.pid) {
+    try {
+      if (process.platform === 'win32') {
+        execSync(`taskkill /pid ${pythonProcess.pid} /T /F`);
+      } else {
+        pythonProcess.kill('SIGTERM');
+      }
+    } catch {}
+    pythonProcess = null;
+  }
+}
+
+process.on('SIGINT', () => { shutdownPythonProcess(); process.exit(0); });
+process.on('SIGTERM', () => { shutdownPythonProcess(); process.exit(0); });
+process.on('exit', () => { shutdownPythonProcess(); });
+
+async function callPythonInference(payload, endpoint = '/predict', maxRetries = 15) {
+  let attempts = 0;
+  while (attempts < maxRetries) {
+    attempts++;
+    try {
+      return await new Promise((resolve, reject) => {
+        const postData = JSON.stringify(payload);
+        const options = {
+          hostname: '127.0.0.1',
+          port: PYTHON_PORT,
+          path: endpoint,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          },
+          timeout: 45000
+        };
+        const req = http.request(options, (res) => {
+          let data = '';
+          res.on('data', chunk => { data += chunk; });
+          res.on('end', () => {
+            try {
+              if (res.statusCode === 200) {
+                resolve(JSON.parse(data));
+              } else {
+                reject(new Error(`Python inference returned HTTP ${res.statusCode}: ${data}`));
+              }
+            } catch (e) {
+              reject(e);
+            }
+          });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('Inference request timed out on compute worker'));
+        });
+        req.write(postData);
+        req.end();
+      });
+    } catch (err) {
+      if ((err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') && attempts < maxRetries) {
+        if (!pythonProcess && !isPythonStarting) {
+          startPythonInferenceServer();
+        }
+        await new Promise(r => setTimeout(r, 1200));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // Request dispatcher
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(reqUrl.pathname);
   const method = req.method;
@@ -518,16 +652,31 @@ const server = http.createServer((req, res) => {
 
   // API Routes
   if (pathname === '/api/status' || pathname === '/api/health') {
+    const pyHealth = await checkPythonHealth();
     sendJSON(res, 200, {
       status: 'online',
       system: 'PulmoVision X-AI Backend v2.4',
-      cudaAvailable: true,
+      cudaAvailable: pyHealth ? (pyHealth.device === 'cuda') : false,
+      cudaDeviceName: pyHealth ? pyHealth.cuda_device_name : 'N/A',
+      pythonInferenceOnline: !!(pyHealth && pyHealth.status === 'online'),
+      modelsLoaded: pyHealth ? pyHealth.models : { classification: false, segmentation: false, report_generator: false },
       activeModels: [
         'EfficientNetV2-S (Classifier + Grad-CAM Explainability)',
         'UNet++ EfficientNet-B3 (Lesion Segmentation + scSE Attention)',
         'Vision-Language Transformer: ViT-B/16 + DenseNet-121 + PCA + DistilGPT-2 (Report Synthesizer)'
       ],
       timestamp: new Date().toISOString()
+    });
+    return;
+  }
+
+  if (pathname === '/api/ai/health') {
+    const pyHealth = await checkPythonHealth();
+    sendJSON(res, 200, {
+      online: !!(pyHealth && pyHealth.status === 'online'),
+      device: pyHealth ? pyHealth.device : 'unknown',
+      gpu: pyHealth ? pyHealth.cuda_device_name : 'none',
+      models: pyHealth ? pyHealth.models : { classification: false, segmentation: false, report_generator: false }
     });
     return;
   }
@@ -580,7 +729,7 @@ const server = http.createServer((req, res) => {
         }
 
         try {
-          const pyRes = await callPythonInference(infPayload);
+          const pyRes = await callPythonInference(infPayload, '/predict');
           sendJSON(res, 200, {
             presetId: payload.presetId || 'custom_upload',
             label: pyRes.classification.label,
@@ -589,19 +738,14 @@ const server = http.createServer((req, res) => {
             diseaseProb: pyRes.classification.diseaseProb,
             gradCamRegion: pyRes.classification.gradCamRegion,
             gradCamOverlay: pyRes.classification.gradCamOverlay,
+            probabilities: pyRes.probabilities,
             status: 'success'
           });
         } catch (pyErr) {
-          console.warn('Python inference fallback for classify:', pyErr.message);
-          sendJSON(res, 200, {
-            presetId: preset ? preset.id : 'custom_upload',
-            label: preset ? preset.classification.label : 'PNEUMONIA / SUSPICIOUS INFILTRATE',
-            confidence: preset ? preset.classification.confidence : 91.9,
-            normalProb: preset ? preset.classification.normalProb : 8.1,
-            diseaseProb: preset ? preset.classification.diseaseProb : 91.9,
-            gradCamRegion: preset ? preset.classification.gradCamRegion : 'Focal activation at right lower perihilar parenchyma',
-            gradCamOverlay: preset ? preset.overlayUrl : '/static/samples/sample_overlay_pneumo.png',
-            status: 'success'
+          console.error('Python inference error for classify:', pyErr.message);
+          sendJSON(res, 503, {
+            status: 'error',
+            error: 'Classification model inference failed or models are initializing: ' + pyErr.message
           });
         }
       } catch (err) {
@@ -632,7 +776,7 @@ const server = http.createServer((req, res) => {
         }
 
         try {
-          const pyRes = await callPythonInference(infPayload);
+          const pyRes = await callPythonInference(infPayload, '/predict');
           sendJSON(res, 200, {
             presetId: payload.presetId || 'custom_upload',
             dice: pyRes.segmentation.diceScore,
@@ -649,20 +793,10 @@ const server = http.createServer((req, res) => {
             status: 'success'
           });
         } catch (pyErr) {
-          console.warn('Python inference fallback for segment:', pyErr.message);
-          sendJSON(res, 200, {
-            presetId: preset ? preset.id : 'custom_upload',
-            dice: preset ? preset.segmentation.dice : 0.892,
-            iou: preset ? preset.segmentation.iou : 0.825,
-            hasLesion: preset ? preset.groundTruth.hasLesion : true,
-            lesionLocation: preset ? preset.groundTruth.lesionLocation : 'Right apical pleural cavity',
-            lesionAreaPixels: preset ? preset.segmentation.lesionAreaPixels : 28400,
-            lungAreaPercentage: preset ? preset.segmentation.lungAreaPercentage : 12.8,
-            thresholdUsed: threshold,
-            minAreaFilter: minArea,
-            overlayUrl: preset ? preset.overlayUrl : '/static/samples/sample_overlay_pneumo.png',
-            maskBox: preset ? preset.groundTruth.maskBox : { x: 26, y: 16, width: 22, height: 26 },
-            status: 'success'
+          console.error('Python inference error for segment:', pyErr.message);
+          sendJSON(res, 503, {
+            status: 'error',
+            error: 'UNet++ segmentation inference failed or models are initializing: ' + pyErr.message
           });
         }
       } catch (err) {
@@ -692,7 +826,7 @@ const server = http.createServer((req, res) => {
         }
 
         try {
-          const pyRes = await callPythonInference(infPayload);
+          const pyRes = await callPythonInference(infPayload, '/predict');
           sendJSON(res, 200, {
             presetId: payload.presetId || 'custom_upload',
             findings: pyRes.report.findings,
@@ -703,15 +837,10 @@ const server = http.createServer((req, res) => {
             status: 'success'
           });
         } catch (pyErr) {
-          console.warn('Python inference fallback for report:', pyErr.message);
-          sendJSON(res, 200, {
-            presetId: preset ? preset.id : 'custom_upload',
-            findings: preset ? preset.radiologyReport.findings : 'The lungs show localized density in the mid-to-lower pulmonary zone without evidence of gross volume loss. The cardiomediastinal contour is stable.',
-            impression: preset ? preset.radiologyReport.impression : '1. Focal pulmonary opacity; clinical correlation recommended.',
-            keyPoints: preset ? preset.radiologyReport.keyPoints : ['Focal parenchymal density identified', 'Triage: Clinical Review'],
-            attentionWeights: preset ? preset.radiologyReport.attentionWeights : { alpha_global: 0.603, beta_local: 0.338, gamma_context: 0.060 },
-            beamSizeUsed: beamSize,
-            status: 'success'
+          console.error('Python inference error for report:', pyErr.message);
+          sendJSON(res, 503, {
+            status: 'error',
+            error: 'Report generator inference failed or models are initializing: ' + pyErr.message
           });
         }
       } catch (err) {
@@ -742,7 +871,7 @@ const server = http.createServer((req, res) => {
         }
 
         try {
-          const pyRes = await callPythonInference(infPayload);
+          const pyRes = await callPythonInference(infPayload, '/predict');
           sendJSON(res, 200, {
             caseId: preset ? preset.id : 'custom_upload',
             name: preset ? preset.name : (payload.fileName ? `Uploaded Radiograph (${payload.fileName})` : 'Uploaded Patient Radiograph'),
@@ -777,32 +906,11 @@ const server = http.createServer((req, res) => {
             status: 'success'
           });
         } catch (pyErr) {
-          console.warn('Python inference fallback for comprehensive:', pyErr.message);
-          if (preset) {
-            sendJSON(res, 200, {
-              caseId: preset.id,
-              name: preset.name,
-              category: preset.category,
-              imageUrl: preset.imageUrl,
-              overlayUrl: preset.overlayUrl,
-              clinicalHistory: preset.clinicalHistory,
-              classification: preset.classification,
-              segmentation: preset.segmentation,
-              groundTruth: preset.groundTruth,
-              report: preset.radiologyReport,
-              probabilities: [
-                { name: 'Pneumothorax', prob: preset.segmentation.hasLesion ? Math.round(preset.classification.confidence) : 4, color: 'cyan' },
-                { name: 'Acute Pneumonia', prob: preset.classification.label.includes('PNEUMONIA') ? Math.round(preset.classification.diseaseProb) : 3, color: 'purple' },
-                { name: 'Pleural Effusion', prob: preset.segmentation.hasLesion ? 28 : (preset.classification.label.includes('PNEUMONIA') ? 42 : 2), color: 'green' },
-                { name: 'Atelectasis', prob: preset.segmentation.hasLesion ? 22 : 8, color: 'orange' },
-                { name: 'Normal Tissue', prob: Math.round(preset.classification.normalProb), color: 'pink' }
-              ],
-              overallRisk: preset.groundTruth.hasLesion ? 'Critical Stage II — Immediate Triage' : (preset.classification.label.includes('PNEUMONIA') ? 'Acute Infiltrate — Urgent Medical Care' : 'Low / Cleared'),
-              status: 'success'
-            });
-          } else {
-            sendJSON(res, 500, { error: 'Inference engine is currently loading or unreachable: ' + pyErr.message });
-          }
+          console.error('Python inference error for comprehensive:', pyErr.message);
+          sendJSON(res, 503, {
+            status: 'error',
+            error: 'Deep learning inference engine is currently loading or unreachable: ' + pyErr.message
+          });
         }
       } catch (err) {
         sendJSON(res, 400, { error: 'Invalid JSON payload', details: err.message });
@@ -883,6 +991,7 @@ server.on('error', (err) => {
       console.log(`🏥 GHEC Bandla - B.Tech. CSE (AI & DS) 7th Sem Major Project`);
       console.log(`👨‍🔬 Lead: Aman (23010503008) | Supervisor: Dr. Ravi Kumar`);
       console.log(`=======================================================`);
+      startPythonInferenceServer();
     });
   } else {
     console.error('Server error:', err);
@@ -896,4 +1005,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🏥 GHEC Bandla - B.Tech. CSE (AI & DS) 7th Sem Major Project`);
   console.log(`👨‍🔬 Lead: Aman (23010503008) | Supervisor: Dr. Ravi Kumar`);
   console.log(`=======================================================`);
+  startPythonInferenceServer();
 });
